@@ -1,19 +1,23 @@
 """
-Detect cuts, track with ByteTrack, and label fighters A/B by trunk color.
+Detect cuts, track with ByteTrack, and label fighters A/B by glove + trunk color.
 
-The labels come from what the fighters look like (their trunks), not from the
-tracker's ID numbers, so they survive camera cuts and ID swaps.
+The labels come from what the fighters look like (their glove and trunk
+colors), not from the tracker's ID numbers, so they survive camera cuts and
+ID swaps.
 
 How it works:
   1. Calibration: you pick Fighter A and Fighter B once on a clear frame
-     (press the number shown on each box). Their trunk colors become the
-     reference. This is saved to a JSON file so you can rerun without picking.
+     (press the number shown on each box). Their glove color (sampled around
+     the wrists/hands) and trunk color (around the hips) become the
+     references. Saved to a JSON file so you can rerun without picking.
   2. Cut detection: a big change in the picture marks a camera cut. The
      tracker is reset at every cut.
-  3. Each frame, every detected person's trunk color is compared with the two
-     references. The best match becomes "A" or "B". People who match neither
+  3. Each frame, every detected person's colors are compared with the two
+     references. Gloves are usually the stronger cue (corner colors), the
+     trunks back them up, and either one can carry a match when the other is
+     hidden. The best match becomes "A" or "B". People who match neither
      (referee, corner staff, crowd) stay unlabeled.
-  4. If a fighter's trunks are hidden for a moment (clinch, turned away), the
+  4. If both cues are hidden for a moment (clinch, turned away), the
      ByteTrack ID can carry the label for a few frames. Rows are marked
      source=color or source=track so you can tell which is which.
 
@@ -24,8 +28,10 @@ Outputs (in --out):
 
 Usage (venv active):
     python label_fighters.py clip.mp4
-    python label_fighters.py clip.mp4 --calib sam2_out/calibration.json   # reuse a calibration
-    python label_fighters.py clip.mp4 --inherit-frames 0                  # pure color labels
+    python label_fighters.py clip.mp4 --use glove                  # gloves only
+    python label_fighters.py clip.mp4 --use trunk                  # trunks only (old behavior)
+    python label_fighters.py clip.mp4 --calib labeled_out/calibration.json   # reuse a calibration
+    python label_fighters.py clip.mp4 --inherit-frames 0           # pure color labels
 
 Needs a desktop session for the calibration window, and regular opencv-python.
 Install: python -m pip install ultralytics opencv-python numpy
@@ -48,11 +54,31 @@ EDGES = [(5, 7), (7, 9), (6, 8), (8, 10), (5, 6), (5, 11), (6, 12), (11, 12),
          (11, 13), (13, 15), (12, 14), (14, 16), (0, 1), (0, 2), (1, 3), (2, 4)]
 
 
-# ---------- color signature ----------
+# ---------- color signatures ----------
+
+def _lab_median(frame, xa, ya, xb, yb, saturated_only=False):
+    """Median Lab color of a region (L scaled 0-100, a/b centered). None if too small."""
+    H, W = frame.shape[:2]
+    xa, xb = int(max(0, xa)), int(min(W, xb))
+    ya, yb = int(max(0, ya)), int(min(H, yb))
+    if xb - xa < 3 or yb - ya < 3:
+        return None
+    crop = cv2.cvtColor(frame[ya:yb, xa:xb], cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+    if len(crop) < 12:
+        return None
+    if saturated_only:
+        # Keep the more colorful half of the pixels, so skin and background
+        # around a glove don't wash out the glove color.
+        chroma = np.hypot(crop[:, 1] - 128, crop[:, 2] - 128)
+        crop = crop[chroma >= np.median(chroma)]
+        if len(crop) < 6:
+            return None
+    lab = np.median(crop, axis=0)
+    return np.array([lab[0] * 100 / 255, lab[1] - 128, lab[2] - 128], dtype=np.float32)
+
 
 def trunk_signature(frame, box, kxy, kc):
-    """Median Lab color of the trunk area (around the hips). None if too small."""
-    H, W = frame.shape[:2]
+    """Color of the trunk area (around the hips). None if too small or unclear."""
     x1, y1, x2, y2 = box
     bh, bw = y2 - y1, x2 - x1
     if bh < 40 or bw < 15:
@@ -69,16 +95,42 @@ def trunk_signature(frame, box, kxy, kc):
         cx = (x1 + x2) / 2
         xa, xb = cx - 0.2 * bw, cx + 0.2 * bw
         ya, yb = y1 + 0.45 * bh, y1 + 0.65 * bh
+    return _lab_median(frame, xa, ya, xb, yb)
 
-    xa, xb = int(max(0, xa)), int(min(W, xb))
-    ya, yb = int(max(0, ya)), int(min(H, yb))
-    if xb - xa < 4 or yb - ya < 4:
-        return None
-    crop = cv2.cvtColor(frame[ya:yb, xa:xb], cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
-    if len(crop) < 25:
-        return None
-    lab = np.median(crop, axis=0)
-    return np.array([lab[0] * 100 / 255, lab[1] - 128, lab[2] - 128], dtype=np.float32)
+
+def glove_signatures(frame, box, kxy, kc, kmin=0.3):
+    """
+    Colors of the glove area at each visible wrist.
+    The patch is centered a little past the wrist, along the forearm direction,
+    since the glove sits beyond the wrist keypoint.
+    Returns (list of Lab colors, list of (cx, cy, r) patches for drawing).
+    """
+    sigs, pts = [], []
+    if kxy is None:
+        return sigs, pts
+    bh = box[3] - box[1]
+    if bh < 40:
+        return sigs, pts
+
+    for w, e in ((9, 7), (10, 8)):  # (wrist, elbow) for left and right arms
+        if kc[w] < kmin:
+            continue
+        wx, wy = float(kxy[w][0]), float(kxy[w][1])
+        if wx <= 0 and wy <= 0:
+            continue
+        cx, cy, r = wx, wy, 0.04 * bh
+        if kc[e] >= kmin:
+            vx, vy = wx - float(kxy[e][0]), wy - float(kxy[e][1])
+            flen = float(np.hypot(vx, vy))
+            if flen > 0.05 * bh:
+                cx, cy = wx + 0.25 * vx, wy + 0.25 * vy
+                r = min(max(0.30 * flen, 0.025 * bh), 0.09 * bh)
+        r = max(r, 3.0)
+        sig = _lab_median(frame, cx - r, cy - r, cx + r, cy + r, saturated_only=True)
+        if sig is not None:
+            sigs.append(sig)
+            pts.append((cx, cy, r))
+    return sigs, pts
 
 
 def color_dist(a, b, l_weight):
@@ -86,15 +138,34 @@ def color_dist(a, b, l_weight):
     return float(np.sqrt((l_weight * d[0]) ** 2 + d[1] ** 2 + d[2] ** 2))
 
 
-def assign_by_color(people, refs, max_dist, l_weight, margin):
+def person_score(p, ref, args):
+    """
+    How far a person is from one fighter's reference, as a fraction of the
+    allowed distance (<= 1.0 means an acceptable match, lower is better).
+    Uses whichever cues (glove, trunk) are visible and enabled.
+    """
+    parts = []
+    if args.use in ("both", "trunk") and p["trunk"] is not None and ref["trunk"] is not None:
+        d = color_dist(p["trunk"], ref["trunk"], args.l_weight)
+        parts.append((args.trunk_weight, d / args.max_dist))
+    if args.use in ("both", "glove") and p["gloves"] and ref["glove"] is not None:
+        # The better of the visible gloves: one may be hidden behind the opponent.
+        d = min(color_dist(g, ref["glove"], args.glove_l_weight) for g in p["gloves"])
+        parts.append((args.glove_weight, d / args.glove_max_dist))
+    if not parts:
+        return float("inf")
+    return sum(w * s for w, s in parts) / sum(w for w, _ in parts)
+
+
+def assign_by_color(people, refs, args):
     """Return a list: 'A', 'B' or None for each person (best joint assignment)."""
     n = len(people)
     D = np.full((n, 2), np.inf)
     for i, p in enumerate(people):
-        if p["sig"] is not None:
-            for k in range(2):
-                D[i, k] = color_dist(p["sig"], refs[k], l_weight)
+        for k in range(2):
+            D[i, k] = person_score(p, refs[k], args)
 
+    limit = 1.0  # scores are already normalized by the allowed distances
     best, best_cost = (None, None), float("inf")
     options = [None] + list(range(n))
     for i in options:
@@ -105,8 +176,8 @@ def assign_by_color(people, refs, max_dist, l_weight, margin):
             ok = True
             for idx, k in ((i, 0), (j, 1)):
                 if idx is None:
-                    cost += max_dist
-                elif D[idx, k] <= max_dist:
+                    cost += limit
+                elif D[idx, k] <= limit:
                     cost += D[idx, k]
                 else:
                     ok = False
@@ -115,16 +186,22 @@ def assign_by_color(people, refs, max_dist, l_weight, margin):
 
     labels = [None] * n
     i, j = best
+    # If swapping A and B fits almost as well, the colors can't tell the two
+    # apart in this frame (for example, identical trunks and no visible gloves).
+    # Leave both unlabeled rather than guess; the tracker carryover can fill in.
+    if i is not None and j is not None:
+        if D[j, 0] <= limit and D[i, 1] <= limit and (D[j, 0] + D[i, 1]) <= best_cost + args.ambiguity:
+            i = j = None
     # A lone assignment must clearly beat the other fighter's color.
-    if i is not None and j is None and D[i, 0] >= margin * D[i, 1]:
+    if i is not None and j is None and D[i, 0] >= args.margin * D[i, 1]:
         i = None
-    if j is not None and i is None and D[j, 1] >= margin * D[j, 0]:
+    if j is not None and i is None and D[j, 1] >= args.margin * D[j, 0]:
         j = None
     if i is not None:
         labels[i] = "A"
     if j is not None:
         labels[j] = "B"
-    return labels
+    return labels, D
 
 
 # ---------- detection helpers ----------
@@ -149,7 +226,8 @@ def people_from_result(frame, r, max_people):
         kxy = kxy_all[i] if kxy_all is not None else None
         kc = kc_all[i] if kc_all is not None else None
         p = dict(box=xyxy[i], conf=float(conf[i]), id=int(ids[i]), kxy=kxy, kc=kc)
-        p["sig"] = trunk_signature(frame, xyxy[i], kxy, kc) if kxy is not None else None
+        p["trunk"] = trunk_signature(frame, xyxy[i], kxy, kc) if kxy is not None else None
+        p["gloves"], p["glove_pts"] = glove_signatures(frame, xyxy[i], kxy, kc)
         people.append(p)
     return people
 
@@ -186,7 +264,29 @@ def draw_person(img, p, label, text=None):
 
 # ---------- calibration ----------
 
+def make_ref(p):
+    glove = np.median(np.stack(p["gloves"]), axis=0) if p["gloves"] else None
+    return {"trunk": p["trunk"], "glove": glove}
+
+
+def ref_to_json(ref):
+    return {k: ([float(x) for x in v] if v is not None else None) for k, v in ref.items()}
+
+
+def ref_from_json(d):
+    if isinstance(d, list):  # old format: trunk color only
+        d = {"trunk": d, "glove": None}
+    return {k: (np.array(d[k], dtype=np.float32) if d.get(k) is not None else None)
+            for k in ("trunk", "glove")}
+
+
 def calibrate(args, det_model):
+    def usable(p):
+        need_trunk = args.use in ("both", "trunk")
+        need_glove = args.use in ("both", "glove")
+        return ((not need_trunk or p["trunk"] is not None)
+                and (not need_glove or bool(p["gloves"])))
+
     cap = cv2.VideoCapture(args.video)
     idx = -1
     while True:
@@ -194,12 +294,13 @@ def calibrate(args, det_model):
         if not ok:
             cap.release()
             raise SystemExit("Ran out of video before calibration finished. "
-                             "Try a clip where both fighters are clearly visible.")
+                             "Try a clip where both fighters are clearly visible, "
+                             "or use --use trunk if the gloves are rarely visible.")
         idx += 1
         if idx % args.calib_step != 0:
             continue
         r = det_model.predict(frame, conf=args.conf, verbose=False, device=args.device)[0]
-        people = [p for p in people_from_result(frame, r, args.max_people) if p["sig"] is not None]
+        people = [p for p in people_from_result(frame, r, args.max_people) if usable(p)]
         if len(people) < 2:
             continue
 
@@ -208,6 +309,10 @@ def calibrate(args, det_model):
             x1, y1, x2, y2 = [int(v) for v in p["box"]]
             cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(disp, str(n), (x1 + 6, y1 + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 0), 4)
+            # Show the glove patches being sampled so you can check them.
+            for cx, cy, rr in p["glove_pts"]:
+                cv2.rectangle(disp, (int(cx - rr), int(cy - rr)), (int(cx + rr), int(cy + rr)),
+                              (0, 255, 255), 2)
         scale = min(1.0, 1280 / disp.shape[1], 720 / disp.shape[0])
         if scale < 1:
             disp = cv2.resize(disp, None, fx=scale, fy=scale)
@@ -219,7 +324,7 @@ def calibrate(args, det_model):
             cv2.putText(show, msg, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
             cv2.putText(show, msg, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             while True:
-                cv2.imshow("Calibrate", show)
+                cv2.imshow("Calibrate (yellow squares = glove areas sampled)", show)
                 key = cv2.waitKey(0) & 0xFF
                 if key == 27:
                     cv2.destroyAllWindows()
@@ -240,8 +345,7 @@ def calibrate(args, det_model):
         cv2.destroyAllWindows()
         cv2.waitKey(1)
         cap.release()
-        refs = [people[chosen[0]]["sig"], people[chosen[1]]["sig"]]
-        return refs
+        return [make_ref(people[chosen[0]]), make_ref(people[chosen[1]])]
 
 
 # ---------- main ----------
@@ -254,16 +358,29 @@ def main():
     ap.add_argument("--device", default=None, help="cpu, cuda:0, ... (default: auto)")
     ap.add_argument("--conf", type=float, default=0.3)
     ap.add_argument("--max-people", type=int, default=6, help="consider only the largest N people")
+    ap.add_argument("--use", default="both", choices=["both", "glove", "trunk"],
+                    help="which color cues to use for labeling (default: both)")
     ap.add_argument("--calib", default=None, help="calibration.json to reuse (skips the picking step)")
     ap.add_argument("--calib-step", type=int, default=15, help="frames between calibration candidates")
     ap.add_argument("--cut-threshold", type=float, default=0.5,
                     help="histogram correlation below this counts as a camera cut")
     ap.add_argument("--max-dist", type=float, default=35.0,
-                    help="max color distance to accept a match (lower = stricter)")
+                    help="max trunk color distance to accept a match (lower = stricter)")
+    ap.add_argument("--glove-max-dist", type=float, default=40.0,
+                    help="max glove color distance to accept a match (lower = stricter)")
+    ap.add_argument("--glove-weight", type=float, default=1.5,
+                    help="how much the glove cue counts versus the trunk cue")
+    ap.add_argument("--trunk-weight", type=float, default=1.0,
+                    help="how much the trunk cue counts versus the glove cue")
     ap.add_argument("--l-weight", type=float, default=0.7,
-                    help="weight of brightness in color distance (lower ignores lighting more)")
+                    help="weight of brightness in trunk color distance (lower ignores lighting more)")
+    ap.add_argument("--glove-l-weight", type=float, default=0.4,
+                    help="weight of brightness in glove color distance (gloves are shiny, so lower)")
     ap.add_argument("--margin", type=float, default=0.8,
                     help="a lone match must be this much closer to its fighter than to the other")
+    ap.add_argument("--ambiguity", type=float, default=0.1,
+                    help="if swapping A and B scores within this much of the best match, "
+                         "leave both unlabeled (raise to be more cautious)")
     ap.add_argument("--inherit-frames", type=int, default=10,
                     help="let a tracker ID carry a label for this many frames when color is unclear "
                          "(0 = color only)")
@@ -280,16 +397,37 @@ def main():
 
     if args.calib:
         data = json.loads(Path(args.calib).read_text())
-        refs = [np.array(data["A"], dtype=np.float32), np.array(data["B"], dtype=np.float32)]
+        refs = [ref_from_json(data["A"]), ref_from_json(data["B"])]
         print(f"Loaded calibration from {args.calib}")
     else:
         refs = calibrate(args, det_model)
-    calib_path = out_dir / "calibration.json"
-    calib_path.write_text(json.dumps({"A": [float(v) for v in refs[0]], "B": [float(v) for v in refs[1]]}))
-    print(f"Reference trunk colors (Lab): A={np.round(refs[0], 1)}  B={np.round(refs[1], 1)}")
-    if color_dist(refs[0], refs[1], args.l_weight) < 2 * args.max_dist * 0.5:
-        print("Warning: the two fighters' trunks look similar. Labels may swap often; "
-              "lower --max-dist or check the video carefully.")
+
+    # If the saved calibration lacks a cue, fall back to what exists.
+    have_trunk = all(r["trunk"] is not None for r in refs)
+    have_glove = all(r["glove"] is not None for r in refs)
+    if args.use == "both" and not have_glove:
+        print("Note: no glove colors in this calibration, using trunk color only.")
+        args.use = "trunk"
+    elif args.use == "both" and not have_trunk:
+        print("Note: no trunk colors in this calibration, using glove color only.")
+        args.use = "glove"
+    elif args.use == "glove" and not have_glove:
+        raise SystemExit("This calibration has no glove colors. Recalibrate without --calib.")
+    elif args.use == "trunk" and not have_trunk:
+        raise SystemExit("This calibration has no trunk colors. Recalibrate without --calib.")
+
+    (out_dir / "calibration.json").write_text(json.dumps(
+        {"A": ref_to_json(refs[0]), "B": ref_to_json(refs[1])}))
+    for name, r in zip(NAMES, refs):
+        print(f"Fighter {name} reference (Lab): "
+              f"trunk={None if r['trunk'] is None else np.round(r['trunk'], 1)}  "
+              f"glove={None if r['glove'] is None else np.round(r['glove'], 1)}")
+
+    # Warn if one fighter's reference would already be accepted as the other.
+    as_person = lambda r: dict(trunk=r["trunk"], gloves=[r["glove"]] if r["glove"] is not None else [])
+    if person_score(as_person(refs[0]), refs[1], args) <= 1.0:
+        print("Warning: the two fighters' colors look similar. Labels may swap often; "
+              "lower --max-dist / --glove-max-dist or check the video carefully.")
 
     cap = cv2.VideoCapture(args.video)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
@@ -301,7 +439,7 @@ def main():
     csv_file = open(out_dir / "fighters_pose.csv", "w", newline="")
     wr = csv.writer(csv_file)
     kp_cols = [f"kp{k}_{c}" for k in range(17) for c in ("x", "y", "conf")]
-    wr.writerow(["frame", "time_s", "shot", "fighter", "source", "track_id", "color_dist",
+    wr.writerow(["frame", "time_s", "shot", "fighter", "source", "track_id", "match_score",
                  "x1", "y1", "x2", "y2"] + kp_cols)
 
     stats = Counter()
@@ -328,7 +466,7 @@ def main():
                               verbose=False, device=args.device)[0]
         people = people_from_result(frame, r, args.max_people)
 
-        labels = assign_by_color(people, refs, args.max_dist, args.l_weight, args.margin)
+        labels, D = assign_by_color(people, refs, args)
         sources = ["color" if lab else None for lab in labels]
 
         # Let a tracker ID carry a label briefly when the color is unclear.
@@ -345,10 +483,10 @@ def main():
                     last_label[p["id"]] = (labels[i], frame_idx)
 
         vis = frame.copy()
-        for p, lab, src in zip(people, labels, sources):
-            d = None
-            if lab and p["sig"] is not None:
-                d = color_dist(p["sig"], refs[NAMES.index(lab)], args.l_weight)
+        for i, (p, lab, src) in enumerate(zip(people, labels, sources)):
+            score = None
+            if lab and src == "color":
+                score = D[i, NAMES.index(lab)]
             draw_person(vis, p, lab, f"{lab}{'' if src == 'color' else '*'}" if lab else None)
             if lab:
                 kp = []
@@ -360,7 +498,7 @@ def main():
                         kp += ["", "", ""]
                 x1, y1, x2, y2 = [round(float(v), 1) for v in p["box"]]
                 wr.writerow([frame_idx, round(frame_idx / fps, 3), shot, lab, src, p["id"],
-                             "" if d is None else round(d, 1), x1, y1, x2, y2] + kp)
+                             "" if score is None else round(float(score), 3), x1, y1, x2, y2] + kp)
                 stats[lab] += 1
         present = {lab for lab in labels if lab}
         if present == {"A", "B"}:
